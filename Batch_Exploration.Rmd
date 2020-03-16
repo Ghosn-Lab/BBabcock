@@ -1,0 +1,224 @@
+---
+title: "Batch Exploration"
+output: html_notebook
+---
+# Initialize Seurat
+```{r}
+library(Seurat)
+setwd("~/Documents/EMORY/Ghosn lab/Batch/")
+source("../Human_BM/SingleCell.Utilities_3.6.R")
+# seurats = an empty list (will contain objects)
+seurats <- list()
+# Establish base variables for importing cells. This is to lighten the Seurat object if any very low-read cells were included below the knee. In this sample no cells were excluded from the matrix at this step.
+min.genes <- 0
+min.cells <- 0
+# Function to import expression matrix, generate seurat object and return object with mouse sample ID set as "replicate" identity class
+prep.Seurat <- function(i){
+  message('Starting with Sample ', i)
+  filtered.data <- Read10X(data.dir = paste0("~/Documents/EMORY/Ghosn lab/Batch/Data/", i))
+  dat <- CreateSeuratObject(counts = filtered.data$`Gene Expression`, project = samp.names[i])
+  dat[['ADT']] <- CreateAssayObject(counts = filtered.data$`Antibody Capture`)
+  return(dat)
+}
+samps <- c(paste0("5GEX_PBMC1_36yoF_F1_B", 1:2), paste0("5GEX_PBMC3_46yoM_H1_B", 1:2))
+samp.names <- c("F1_B1", "F1_B2", "H1_B1", "H1_B2")
+names(samp.names) <- samps
+# Applying the above function to each mouse ID and storing the output Seurats as a list
+seurats <- lapply(samps, function(x) prep.Seurat(x))
+names(seurats) <- samps
+# Sequentially merging seurat objects
+HBM <- merge(x = seurats[[1]], y = seurats[2:length(seurats)],
+             add.cell.ids = names(seurats), project = "HBM")
+
+saveRDS(HBM, "~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+```
+
+# F1 DR & vis B.E.
+```{r}
+# Import libraries & data
+library(Seurat)
+setwd("~/Documents/EMORY/Ghosn lab/Batch/")
+source("../Human_BM/SingleCell.Utilities_3.6.R")
+
+HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+# Working only with F1 (read depth) set
+F1 <- subset(HBM, idents = paste0("F1_B", 1:2))
+# Filter on mitochondrial UMIs, nReads & nGenes
+# Generate pdf of before & after filering
+mito.genes <- grep(pattern = "^MT-", 
+                   x = rownames(F1), 
+                   value = T)
+percent.mito <- (Matrix::colSums(F1[mito.genes, ])
+                 /Matrix::colSums(F1))*100
+F1 <- AddMetaData(object = F1, 
+                  metadata = percent.mito, 
+                  col.name = "percent.mito")
+p <- list()
+p[[1]] <- VlnPlot(F1, c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
+                  group.by = 'orig.ident')
+# Find max thresholds (5 SD above median)
+ThreshFilter <- function(obj){
+  obj <- subset(obj, subset = nFeature_RNA > 500)
+  nUMI <- obj$nCount_RNA
+  nGene <- obj$nFeature_RNA
+  pMito <- obj$percent.mito
+  max.UMI <- 5*sd(nUMI) + median(nUMI)
+  max.Gene <- 5*sd(nGene) + median(nGene)
+  max.mito <- 5*sd(pMito) + median(pMito)
+# Apply thresholds to subset object
+  obj <- subset(obj, subset = nCount_RNA < max.UMI) %>%
+         subset(nFeature_RNA < max.Gene) %>%
+         subset(percent.mito < max.mito)
+  return(obj)
+}
+sets <- c(F1_B1, F1_B2)
+sets <- lapply(sets, function(obj) ThreshFilter(obj))
+# Save "after" pdf vlnplot
+p[[2]] <- VlnPlot(merge(x = sets[[1]], y = sets[[2]], merge.data = T), 
+                  c("nCount_RNA", "nFeature_RNA", "percent.mito"), group.by = 'orig.ident')
+pdf("./F1_PrePost_Filter_Vln.pdf")
+plot_grid(p[[1]], p[[2]])
+dev.off()
+# 
+F1_B1 <- subset(F1, idents = "F1_B1")
+F1_B2 <- subset(F1, idents = "F1_B2")
+
+sets = lapply(sets, function(sm) NormalizeData(sm, verbose = FALSE) %>%
+                FindVariableFeatures(selection.method = "vst", nfeatures = 2000)
+              )
+var.genes <- union(sets[[1]]@assays$RNA@var.features, sets[[2]]@assays$RNA@var.features)
+sets = lapply(sets, function(sm) ScaleData(sm, features = var.genes))
+
+scale.data <- cbind(sets[[1]]@assays$RNA@scale.data[var.genes, ],
+                    sets[[2]]@assays$RNA@scale.data[var.genes, ])
+F1@assays$RNA@var.features <- var.genes
+F1@assays$RNA@scale.data <- scale.data[var.genes, Cells(F1)]
+F1 <- RunPCA(F1, npcs = 55)
+# New "vst" method:
+# Variance Stabilizing Transformation
+# Loess Regression of mean-variance relationship
+# Predict variance from regression (actually predicted stdev)
+# Difference between actual expression & mean expression, divided by *predicted* stdev
+# AKA, how many stdevs from the mean, using mean-corrected stdev
+
+# New ScaleData adjusts mean to zero (conceptually similar to prior regression, except by subtracting mean from each value)
+# Adjusts variance to 1
+TestPCA(F1)
+#7>2, 13>1
+#
+#Transfer to Server
+F1 <- RunPCA(F1, npcs = 50)
+F1 <- JackStraw(F1, num.replicate = 1000, dims = 60)
+F1 <- ScoreJackStraw(F1, dims = 1:60)
+JackStrawPlot(F1, dims = 1:60)
+
+saveRDS(F1, "./F1_BE_working.rds")
+F1 <- readRDS("./F1_BE_JS_working.rds")
+F1 <- RunTSNE(F1, dims = 1:12, reduction = "pca")
+pdf("./PCA_F1_BE_CompVln.pdf")
+wilcox.p <- function(n){
+  #print(VlnPlot(F1, features = paste0('PC_', n), group.by = "orig.ident"))
+  t <- wilcox.test(F1@reductions$pca@cell.embeddings[B1.cells, paste0('PC_', n)], 
+               F1@reductions$pca@cell.embeddings[B2.cells, paste0('PC_', n)])
+  return(-log(t$p.value))
+}
+
+x <- sapply(1:55, FUN = function(n) wilcox.p(n))
+plot(x[1:55])
+
+dev.off()
+VlnPlot(F1, "PC_55", group.by = 'orig.ident')
+head(F1@reductions$pca@feature.loadings[, 'PC_13'])
+B1.cells <- WhichCells(F1, ident = "F1_B1")
+B2.cells <- WhichCells(F1, ident = "F1_B2")
+t.test(F1@reductions$pca@cell.embeddings[B1.cells, "PC_13"], F1@reductions$pca@cell.embeddings[B2.cells, "PC_13"])
+FeaturePlot(F1, "TNFRSF17", reduction = "tsne")
+
+
+```
+
+# H1 DR & vis B.E.
+```{r}
+library(Seurat)
+setwd("~/Documents/EMORY/Ghosn lab/Batch/")
+source("../Human_BM/SingleCell.Utilities_3.6.R")
+
+HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+H1 <- subset(HBM, idents = paste0("H1_B", 1:2))
+
+mito.genes <- grep(pattern = "^MT-", 
+                   x = rownames(H1), 
+                   value = T)
+percent.mito <- (Matrix::colSums(H1[mito.genes, ])
+                 /Matrix::colSums(H1))*100
+H1 <- AddMetaData(object = H1, 
+                  metadata = percent.mito, 
+                  col.name = "percent.mito")
+p <- list()
+p[[1]] <- VlnPlot(H1, c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
+                  group.by = 'orig.ident')
+VlnPlot(t, "nCount_RNA", group.by = 'orig.ident')
+H1 <- subset(H1, subset = nFeature_RNA > 500)
+nUMI <- H1$nCount_RNA
+nGene <- H1$nFeature_RNA
+pMito <- H1$percent.mito
+max.UMI <- 5*sd(nUMI) + median(nUMI)
+max.Gene <- 5*sd(nGene) + median(nGene)
+max.mito <- 5*sd(pMito) + median(pMito)
+
+H1 <- subset(H1, 
+       subset = nCount_RNA < max.UMI & nFeature_RNA < max.Gene & percent.mito < max.mito)
+
+p[[2]] <- VlnPlot(H1, c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
+                  group.by = 'orig.ident')
+plot_grid(p[[1]], p[[2]])
+
+H1 <- NormalizeData(H1, verbose = FALSE) %>%
+      FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+      ScaleData(verbose = FALSE, )
+
+# New "vst" method:
+# Variance Stabilizing Transformation
+# Loess Regression of mean-variance relationship
+# Predict variance from regression (actually predicted stdev)
+# Difference between actual expression & mean expression, divided by *predicted* stdev
+# AKA, how many stdevs from the mean, using mean-corrected stdev
+
+# New ScaleData adjusts mean to zero (conceptually similar to prior regression, except by subtracting mean from each value)
+# Adjusts variance to 1
+TestPCA(H1)
+#6>2, 12>1
+H1 <- RunPCA(H1, npcs = 50)
+H1 <- JackStraw(H1, num.replicate = 50, dims = 50)
+H1 <- ScoreJackStraw(H1, dims = 1:50)
+JackStrawPlot(H1, dims = 1:60)
+saveRDS(H1, "./H1_BE_working.rds")
+```
+
+```{r}
+library(Seurat)
+setwd("~/Documents/EMORY/Ghosn lab/Batch/")
+source("../Human_BM/SingleCell.Utilities_3.6.R")
+HBM <- readRDS("./HBM_working.rds")
+TestPCA(HBM)
+# 7 > 2; 12 > 1
+HBM <- RunPCA(HBM, npcs = 30)
+HBM <- RunTSNE(HBM, dims = 1:12, check_duplicates = F)
+HBM <- FindNeighbors(HBM, reduction = "pca", dims = 1:12)
+HBM <- FindClusters(HBM, resolution = 0.6)
+p <- list()
+p[[1]] <- DimPlot(HBM, reduction.use = 'tsne')
+HBM <- RunPCA(HBM, npcs = 15)
+HBM <- RunTSNE(HBM, dims = 1:15)
+HBM <- FindNeighbors(HBM, reduction = "pca", dims = 1:15)
+HBM <- FindClusters(HBM, resolution = 0.6)
+p[[2]] <- DimPlot(HBM, reduction.use = 'tsne', cols = c(colors.use, more.colors))
+
+plot_grid(p[[1]], p[[2]])
+
+saveRDS(HBM, "./HBM_working.rds")
+
+DimPlot(HBM, dims = c(1,2), reduction = "pca")
+VlnPlot(HBM, "PC_1", group.by = "orig.ident")
+
+```
