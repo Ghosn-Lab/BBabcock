@@ -30,7 +30,7 @@ names(seurats) <- samps
 HBM <- merge(x = seurats[[1]], y = seurats[2:length(seurats)],
              add.cell.ids = names(seurats), project = "HBM")
 
-saveRDS(HBM, "~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+saveRDS(HBM, "~/Documents/EMORY/Ghosn lab/Batch/Data/HBM_batch.rds")
 ```
 
 # F1 DR & vis B.E.
@@ -40,7 +40,7 @@ library(Seurat)
 setwd("~/Documents/EMORY/Ghosn lab/Batch/")
 source("../Human_BM/SingleCell.Utilities_3.6.R")
 
-HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/Data/HBM_batch.rds")
 # Working only with F1 (read depth) set
 F1 <- subset(HBM, idents = paste0("F1_B", 1:2))
 # Filter on mitochondrial UMIs, nReads & nGenes
@@ -54,46 +54,52 @@ F1 <- AddMetaData(object = F1,
                   metadata = percent.mito, 
                   col.name = "percent.mito")
 p <- list()
-p[[1]] <- VlnPlot(F1, c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
-                  group.by = 'orig.ident')
+p[[1]] <- VlnPlot(F1, features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
+                  cols = viridis::viridis(3), group.by = 'orig.ident')
 # Find max thresholds (5 SD above median)
 ThreshFilter <- function(obj){
   obj <- subset(obj, subset = nFeature_RNA > 500)
   nUMI <- obj$nCount_RNA
   nGene <- obj$nFeature_RNA
   pMito <- obj$percent.mito
-  max.UMI <- 5*sd(nUMI) + median(nUMI)
-  max.Gene <- 5*sd(nGene) + median(nGene)
-  max.mito <- 5*sd(pMito) + median(pMito)
+  # <<- operator to make variable available from within subset function 
+  # (otherwise scoped only to within ThreshFilter)
+  max.UMI <<- 5*sd(nUMI) + median(nUMI)
+  max.Gene <<- 5*sd(nGene) + median(nGene)
+  max.mito <<- 5*sd(pMito) + median(pMito)
+  print(paste0(unique(obj$orig.ident), 
+          "; max.umi = ", max.UMI, 
+          "; max.Gene = ", max.Gene,
+          "; max.mito = ", max.mito))
 # Apply thresholds to subset object
-  obj <- subset(obj, subset = nCount_RNA < max.UMI) %>%
+  obj <- obj %>% subset(subset = nCount_RNA < max.UMI) %>%
          subset(nFeature_RNA < max.Gene) %>%
          subset(percent.mito < max.mito)
   return(obj)
 }
-sets <- c(F1_B1, F1_B2)
+
+sets <- c(subset(F1, idents = "F1_B1"), subset(F1, idents = "F1_B2"))
 sets <- lapply(sets, function(obj) ThreshFilter(obj))
 # Save "after" pdf vlnplot
-p[[2]] <- VlnPlot(merge(x = sets[[1]], y = sets[[2]], merge.data = T), 
-                  c("nCount_RNA", "nFeature_RNA", "percent.mito"), group.by = 'orig.ident')
-pdf("./F1_PrePost_Filter_Vln.pdf")
+p[[2]] <- VlnPlot(merge(x = sets[[1]], y = sets[[2]], merge.data = T), cols = viridis::viridis(3), 
+                 features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), group.by = 'orig.ident')
+pdf("./Figures/F1_PrePost_Filter_Vln.pdf")
 plot_grid(p[[1]], p[[2]])
 dev.off()
 # 
-F1_B1 <- subset(F1, idents = "F1_B1")
-F1_B2 <- subset(F1, idents = "F1_B2")
 
-sets = lapply(sets, function(sm) NormalizeData(sm, verbose = FALSE) %>%
+sets <- lapply(sets, function(sm) NormalizeData(sm, verbose = FALSE) %>%
                 FindVariableFeatures(selection.method = "vst", nfeatures = 2000)
               )
 var.genes <- union(sets[[1]]@assays$RNA@var.features, sets[[2]]@assays$RNA@var.features)
-sets = lapply(sets, function(sm) ScaleData(sm, features = var.genes))
+sets <- lapply(sets, function(sm) ScaleData(sm, features = var.genes))
 
 scale.data <- cbind(sets[[1]]@assays$RNA@scale.data[var.genes, ],
                     sets[[2]]@assays$RNA@scale.data[var.genes, ])
+F1 <- subset(F1, cells = c(Cells(sets[[1]]), Cells(sets[[2]])))
 F1@assays$RNA@var.features <- var.genes
 F1@assays$RNA@scale.data <- scale.data[var.genes, Cells(F1)]
-F1 <- RunPCA(F1, npcs = 55)
+F1 <- RunPCA(F1, npcs = 75)
 # New "vst" method:
 # Variance Stabilizing Transformation
 # Loess Regression of mean-variance relationship
@@ -105,37 +111,72 @@ F1 <- RunPCA(F1, npcs = 55)
 # Adjusts variance to 1
 TestPCA(F1)
 #7>2, 13>1
-#
-#Transfer to Server
-F1 <- RunPCA(F1, npcs = 50)
-F1 <- JackStraw(F1, num.replicate = 1000, dims = 60)
-F1 <- ScoreJackStraw(F1, dims = 1:60)
-JackStrawPlot(F1, dims = 1:60)
-
-saveRDS(F1, "./F1_BE_working.rds")
-F1 <- readRDS("./F1_BE_JS_working.rds")
-F1 <- RunTSNE(F1, dims = 1:12, reduction = "pca")
-pdf("./PCA_F1_BE_CompVln.pdf")
+B1.cells <- WhichCells(F1, ident = "F1_B1")
+B2.cells <- WhichCells(F1, ident = "F1_B2")
 wilcox.p <- function(n){
   #print(VlnPlot(F1, features = paste0('PC_', n), group.by = "orig.ident"))
   t <- wilcox.test(F1@reductions$pca@cell.embeddings[B1.cells, paste0('PC_', n)], 
                F1@reductions$pca@cell.embeddings[B2.cells, paste0('PC_', n)])
   return(-log(t$p.value))
 }
+x <- sapply(1:75, FUN = function(n) wilcox.p(n))
 
-x <- sapply(1:55, FUN = function(n) wilcox.p(n))
-plot(x[1:55])
-
+pdf("./Figures/PCA_F1_BE_ttest.pdf")
+plot(x[1:75])
 dev.off()
-VlnPlot(F1, "PC_55", group.by = 'orig.ident')
-head(F1@reductions$pca@feature.loadings[, 'PC_13'])
-B1.cells <- WhichCells(F1, ident = "F1_B1")
-B2.cells <- WhichCells(F1, ident = "F1_B2")
-t.test(F1@reductions$pca@cell.embeddings[B1.cells, "PC_13"], F1@reductions$pca@cell.embeddings[B2.cells, "PC_13"])
-FeaturePlot(F1, "TNFRSF17", reduction = "tsne")
+pdf("./Figures/PCA_F1_BE_CompVln.pdf")
+VlnPlot(F1, "PC_1", group.by = "orig.ident", cols = viridis::viridis(3))
+dev.off()
+F1 <- RunUMAP(F1, dims = 1:75)
+F1 <- FindNeighbors(F1)
+F1 <- FindClusters(F1, resolution = 0.8)
+pdf("./Figures/umap_F1_BE_Sample.pdf")
+DimPlot(F1, reduction = "umap", cols = viridis::viridis(3), group.by = "orig.ident")
+dev.off()
+pdf("./Figures/umap_F1_BE_PC1.pdf")
+FeaturePlot(F1, reduction = "umap", cols = viridis::viridis(3), features = "PC_1")
+dev.off()
 
-
+saveRDS(F1, "./Data/F1_BE_working.rds")
 ```
+
+# F1 Cell Label
+```{r}
+library(Seurat)
+setwd("~/Documents/EMORY/Ghosn lab/Batch/")
+source("../Human_BM/SingleCell.Utilities_3.6.R")
+
+F1 <- readRDS("./Data/F1_BE_working.rds")
+F1 <- NormalizeData(F1, assay = "ADT", normalization.method = "CLR")
+split.CD <- function(x){
+  toupper(trimws(unlist(lapply(strsplit(x, "-"), '[[', 1))))
+}
+rownames(F1@assays$ADT@counts) <- paste('ADT', 
+                                         plyr::mapvalues(x = rownames(F1@assays$ADT),
+                                                         from = rownames(F1@assays$ADT),
+                                                to = split.CD(rownames(F1@assays$ADT))), 
+                                         sep = "_")
+rownames(F1@assays$ADT@data) <- rownames(F1@assays$ADT@counts)
+F1@assays$RNA@data <- rbind(F1@assays$ADT@data, F1@assays$RNA@data)
+
+DimPlot(F1, reduction = "umap", cols = colors.use)
+
+MultiFeaturePlot(F1, c("ADT_CD8a"), reduction = "umap", threshold = 1)
+# Cluster 0-5,7,8 = T-cells & NKs
+# CD3, CD16, CD56, CD4, CD8
+MultiFeaturePlot(F1, c("ADT_CD138"), reduction = "umap", threshold = 1.2)
+# Cluster 10, 11 B Cells. CD19.
+MultiFeaturePlot(F1, c("ADT_CD14"), reduction = "umap", threshold = 2)
+# Cluster 13 Macrophages. CD68 (RNA) CD14 low, CD16 high
+# Cluster 6 Monocytes. CD68 (RNA) CD14 high, CD16 low
+MultiFeaturePlot(F1, c("CHIL3"), reduction = "umap", threshold = 1)
+# Cluster 9 Neutrophils. CD11b, CXCR1&2 (RNA)
+MultiFeaturePlot(F1, c("ADT_CD25"), reduction = "umap", threshold = 1)
+# Cluster 12 Myeloid Dendritic Cells. HLA
+m <- FindMarkers(F1, ident.1 = 12, ident.2 = 14)
+# Cluster 12 
+```
+
 
 # H1 DR & vis B.E.
 ```{r}
@@ -143,7 +184,7 @@ library(Seurat)
 setwd("~/Documents/EMORY/Ghosn lab/Batch/")
 source("../Human_BM/SingleCell.Utilities_3.6.R")
 
-HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/HBM_batch.rds")
+HBM <- readRDS("~/Documents/EMORY/Ghosn lab/Batch/Data/HBM_batch.rds")
 H1 <- subset(HBM, idents = paste0("H1_B", 1:2))
 
 mito.genes <- grep(pattern = "^MT-", 
@@ -192,14 +233,14 @@ H1 <- RunPCA(H1, npcs = 50)
 H1 <- JackStraw(H1, num.replicate = 50, dims = 50)
 H1 <- ScoreJackStraw(H1, dims = 1:50)
 JackStrawPlot(H1, dims = 1:60)
-saveRDS(H1, "./H1_BE_working.rds")
+saveRDS(H1, "./Data/H1_BE_working.rds")
 ```
 
 ```{r}
 library(Seurat)
 setwd("~/Documents/EMORY/Ghosn lab/Batch/")
 source("../Human_BM/SingleCell.Utilities_3.6.R")
-HBM <- readRDS("./HBM_working.rds")
+HBM <- readRDS("./Data/HBM_working.rds")
 TestPCA(HBM)
 # 7 > 2; 12 > 1
 HBM <- RunPCA(HBM, npcs = 30)
@@ -216,7 +257,7 @@ p[[2]] <- DimPlot(HBM, reduction.use = 'tsne', cols = c(colors.use, more.colors)
 
 plot_grid(p[[1]], p[[2]])
 
-saveRDS(HBM, "./HBM_working.rds")
+saveRDS(HBM, "./Data/HBM_working.rds")
 
 DimPlot(HBM, dims = c(1,2), reduction = "pca")
 VlnPlot(HBM, "PC_1", group.by = "orig.ident")
